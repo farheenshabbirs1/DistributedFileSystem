@@ -1,0 +1,70 @@
+# Runs a real, multi-process DFS cluster: 5 storage-node containers plus one controller
+# container, each an independent JVM talking to the others only over TCP + Protobuf (the same
+# NodeServer/NodeClient wire protocol the unit tests and Demo.java exercise in-process).
+#
+# The in-process demo (`mvn compile exec:java`, see the root README) still runs 24 nodes as
+# threads in one JVM to demonstrate scale cheaply; this compose file demonstrates the same
+# mechanisms (round-robin placement, heartbeat failure detection, replication healing) as
+# genuinely separate OS processes, at a smaller, laptop-friendly node count. Both are real --
+# NodeServer has always been a real bound TCP socket either way.
+#
+# Run: cd infra && docker compose up --build
+# Then: docker compose logs -f controller
+services:
+  storage-node-1:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.NodeServerMain"]
+    environment:
+      NODE_ID: node-1
+      NODE_PORT: "6000"
+
+  storage-node-2:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.NodeServerMain"]
+    environment:
+      NODE_ID: node-2
+      NODE_PORT: "6000"
+
+  storage-node-3:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.NodeServerMain"]
+    environment:
+      NODE_ID: node-3
+      NODE_PORT: "6000"
+
+  storage-node-4:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.NodeServerMain"]
+    environment:
+      NODE_ID: node-4
+      NODE_PORT: "6000"
+
+  storage-node-5:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.NodeServerMain"]
+    environment:
+      NODE_ID: node-5
+      NODE_PORT: "6000"
+
+  controller:
+    build: ..
+    command: ["java", "-cp", "app.jar", "com.farheenshaikh.dfs.ControllerMain"]
+    environment:
+      NODE_ENDPOINTS: >-
+        node-1=storage-node-1:6000,
+        node-2=storage-node-2:6000,
+        node-3=storage-node-3:6000,
+        node-4=storage-node-4:6000,
+        node-5=storage-node-5:6000
+      REPLICATION_FACTOR: "3"
+      HEARTBEAT_INTERVAL_MS: "1000"
+      HEARTBEAT_TIMEOUT_MS: "3000"
+      RPC_TIMEOUT_MS: "2000"
+      REPLICATION_SWEEP_INTERVAL_MS: "2000"
+      STATUS_LOG_INTERVAL_MS: "10000"
+    depends_on:
+      - storage-node-1
+      - storage-node-2
+      - storage-node-3
+      - storage-node-4
+      - storage-node-5

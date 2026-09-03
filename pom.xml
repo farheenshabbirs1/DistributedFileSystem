@@ -66,6 +66,29 @@
                     </archive>
                 </configuration>
             </plugin>
+            <!--
+                Bundles protobuf-java into the jar so the container image (infra/, Dockerfile)
+                can run NodeServerMain / ControllerMain with a plain `java -cp app.jar <class>`,
+                no separate dependency-resolution step needed at runtime. `mvn package` produces
+                both the thin jar (maven-jar-plugin, above) and this `-shaded.jar`.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <shadedArtifactAttached>true</shadedArtifactAttached>
+                            <shadedClassifierName>shaded</shadedClassifierName>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
         </plugins>
     </build>
 </project>
