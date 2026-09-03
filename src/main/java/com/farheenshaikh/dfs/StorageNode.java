@@ -5,15 +5,15 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * A single storage node in the cluster: holds chunk bytes plus a checksum for
- * each chunk, and reports liveness via periodic heartbeats.
+ * The local storage engine embedded inside a {@link com.farheenshaikh.dfs.net.NodeServer}:
+ * holds chunk bytes plus a SHA-256 checksum for each chunk. This class itself does no
+ * networking -- it's the thing a NodeServer calls into after decoding an RPC.
  */
 public class StorageNode {
 
     public final String id;
     private final Map<String, byte[]> chunks = new ConcurrentHashMap<>();
     private final Map<String, String> checksums = new ConcurrentHashMap<>();
-    private volatile long lastHeartbeat = System.currentTimeMillis();
 
     public StorageNode(String id) {
         this.id = id;
@@ -40,20 +40,14 @@ public class StorageNode {
         return chunks.containsKey(chunkId);
     }
 
-    /** Simulates disk-level corruption, for demo/test purposes. */
-    public void corrupt(String chunkId) {
+    /** Simulates disk-level corruption, for demo/test purposes. Returns false if the chunk is absent. */
+    public boolean corrupt(String chunkId) {
         byte[] data = chunks.get(chunkId);
-        if (data != null && data.length > 0) {
-            data[0] ^= 0xFF; // flip a byte; the stored checksum no longer matches
+        if (data == null || data.length == 0) {
+            return false;
         }
-    }
-
-    public void heartbeat() {
-        lastHeartbeat = System.currentTimeMillis();
-    }
-
-    public boolean isAlive(long timeoutMs) {
-        return System.currentTimeMillis() - lastHeartbeat < timeoutMs;
+        data[0] ^= 0xFF; // flip a byte; the stored checksum no longer matches
+        return true;
     }
 
     @Override

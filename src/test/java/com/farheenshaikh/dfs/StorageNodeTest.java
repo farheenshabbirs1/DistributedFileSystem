@@ -11,6 +11,11 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+/**
+ * Unit tests for the local storage engine only -- no networking involved. See
+ * {@link ControllerTest} and {@link FileChunkerTest} for the networked, end-to-end behavior
+ * (heartbeat-based liveness now lives in {@link HeartbeatMonitor}, driven over real RPCs).
+ */
 class StorageNodeTest {
 
     @Test
@@ -31,25 +36,30 @@ class StorageNodeTest {
     }
 
     @Test
+    void hasChunkReflectsWhatHasBeenStored() {
+        StorageNode node = new StorageNode("node-1");
+        assertFalse(node.hasChunk("chunk-a"));
+
+        node.store("chunk-a", "data".getBytes());
+
+        assertTrue(node.hasChunk("chunk-a"));
+    }
+
+    @Test
     void corruptedChunkFailsChecksumVerificationOnRead() {
         StorageNode node = new StorageNode("node-1");
         node.store("chunk-a", "chunk contents".getBytes());
 
-        node.corrupt("chunk-a");
+        assertTrue(node.corrupt("chunk-a"));
 
         assertThrows(IOException.class, () -> node.read("chunk-a"));
     }
 
     @Test
-    void isAliveReflectsHeartbeatRecency() throws InterruptedException {
+    void corruptReturnsFalseForAMissingChunk() {
         StorageNode node = new StorageNode("node-1");
-        assertTrue(node.isAlive(1000));
 
-        Thread.sleep(50);
-        assertFalse(node.isAlive(10));
-
-        node.heartbeat();
-        assertTrue(node.isAlive(1000));
+        assertFalse(node.corrupt("does-not-exist"));
     }
 
     @Test

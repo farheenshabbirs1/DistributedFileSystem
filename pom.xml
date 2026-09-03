@@ -11,9 +11,10 @@
 
     <name>Distributed File System</name>
     <description>
-        A compact distributed file system in Java demonstrating chunked storage with round-robin
-        partitioning, heartbeat-based failure detection, poll-driven re-replication, and SHA-256
-        checksum-based corruption detection and recovery.
+        A distributed file system in Java: real, independently running storage nodes that talk
+        to each other over TCP sockets using Protocol Buffers, coordinated by a controller that
+        does chunked storage with round-robin partitioning, heartbeat-based failure detection,
+        poll-driven re-replication, and SHA-256 checksum-based corruption detection and recovery.
     </description>
 
     <properties>
@@ -21,9 +22,15 @@
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <junit.version>5.10.2</junit.version>
+        <protobuf.version>3.21.12</protobuf.version>
     </properties>
 
     <dependencies>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>${protobuf.version}</version>
+        </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter</artifactId>

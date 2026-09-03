@@ -1,53 +1,89 @@
 # Distributed File System
 
-A compact, single-purpose distributed file system in Java that demonstrates
-four core building blocks of real storage systems:
+A distributed file system in Java: real, independently running storage node
+servers that talk to each other over TCP sockets using **Protocol Buffers**,
+coordinated by a controller that implements four core building blocks of
+real storage systems:
 
 - **Chunked storage with round-robin partitioning** across storage nodes
-- **Heartbeat-based failure detection**
+- **Heartbeat-based failure detection**, driven by real RPCs over the network
 - **Poll-driven re-replication** that maintains a user-defined replication factor
 - **SHA-256 checksum-based corruption detection and recovery**
 
-It's intentionally small (no networking -- nodes are in-process objects) so the
-coordination logic is easy to read end to end, while still behaving like a
-real cluster: nodes fail, disks corrupt, and the system detects and heals both.
+Every node in the cluster is a genuine `NodeServer` bound to its own TCP port,
+reachable only through Protobuf-encoded requests -- there's no in-process
+shortcut. The demo starts 24 of them, writes a file across the cluster in
+parallel, kills one node's server outright and corrupts a chunk on another
+via RPC, and shows the cluster detect and heal both failures on its own.
 
 ```
-put/getFile ──▶ FileChunker ──▶ Controller ──▶ StorageNode (×N)
-                (fixed-size      (placement,      (chunk bytes +
-                 chunking)        replication,      SHA-256 checksum,
-                                  healing)           liveness)
+put/getFile ──▶ FileChunker ──▶ Controller ──▶ NodeClient ──(TCP + Protobuf)──▶ NodeServer ──▶ StorageNode
+                (parallel,        (placement,      (RPC stub,                    (socket          (chunk bytes +
+                 per-chunk          replication,     one connection               server,           SHA-256
+                 fan-out)           healing,          per call)                   thread pool)       checksum)
+                                    heartbeat
+                                    polling)
 ```
 
 ## Architecture
 
-- **`StorageNode`** -- holds chunk bytes plus a SHA-256 checksum per chunk,
-  and tracks its own liveness via a `heartbeat()` timestamp. `read()`
-  re-verifies the checksum on every call and throws if the data has been
-  corrupted since it was written.
-- **`Controller`** -- the cluster's metadata and coordination layer. It
-  never touches chunk bytes directly:
+- **`dfs.proto`** -- the wire schema: `NodeRequest`/`NodeResponse` envelopes
+  (each a `oneof` over four RPCs) carrying `StoreChunkRequest/Response`,
+  `ReadChunkRequest/Response`, `HeartbeatRequest/Response`, and a
+  `CorruptChunkRequest/Response` test/demo hook for injecting corruption
+  over the wire instead of reaching into a node directly. The generated
+  Java (`DfsProto.java`) is committed under `src/main/java` so the project
+  builds with nothing but a JDK, Maven, and the `protobuf-java` runtime --
+  regenerating it only matters if you change `dfs.proto` (see below).
+- **`NodeServer`** -- a real `ServerSocket` bound to its own port, backed by
+  a thread pool. Each connection is read as a length-delimited `NodeRequest`
+  (`Message.parseDelimitedFrom`), dispatched to a local `StorageNode`, and
+  answered with a length-delimited `NodeResponse` (`writeDelimitedTo`) --
+  compact binary framing over a plain socket, no text parsing.
+- **`NodeClient`** -- the RPC stub `Controller` uses to talk to one
+  `NodeServer`. Every call opens a fresh socket with a connect/read timeout,
+  which is what turns a dead or unresponsive node into an `IOException`
+  instead of a hang -- the signal the heartbeat monitor and read/write paths
+  rely on to detect failure.
+- **`StorageNode`** -- the local storage engine embedded inside a
+  `NodeServer`: chunk bytes plus a SHA-256 checksum per chunk. `read()`
+  re-verifies the checksum every call and throws if the data has been
+  corrupted since it was written; `corrupt()` (invoked only via the
+  `CorruptChunkRequest` RPC) simulates on-disk corruption for demos/tests.
+- **`HeartbeatMonitor`** -- **heartbeat-based failure detection**: on a fixed
+  interval, pings every registered node's real `Heartbeat` RPC *in parallel*
+  and records the timestamp of each successful reply. A node counts as alive
+  if it answered within the timeout window; a node that's down, unreachable,
+  or too slow simply ages out.
+- **`Controller`** -- the cluster's coordination layer. It never touches
+  chunk bytes directly, only through `NodeClient`:
   - `assign(count)` implements **round-robin partitioning**: it ranks the
     currently alive nodes into a sorted ring and hands out `count` of them
     starting from a rotating cursor, so consecutive chunks spread evenly
     across the cluster instead of piling onto the same few nodes.
-  - `aliveNodes()` implements **heartbeat-based failure detection**: a node
-    is "alive" if it heartbeated within the configured timeout window.
+  - `writeChunk()` stores a chunk on `replicationFactor` nodes **in
+    parallel** (one RPC per replica, fanned out on a thread pool) rather
+    than one at a time.
+  - `readChunk()` **races** RPCs to every alive replica in parallel and
+    returns the first one that passes checksum verification, so one slow or
+    dead replica doesn't add latency as long as another answers.
   - `replicationSweep()` implements **poll-driven re-replication**: called
     on a timer, it walks every chunk, and for any chunk with fewer alive
-    replicas than the target replication factor, copies it from a healthy
-    replica onto a freshly assigned node. If the replica it tries to copy
-    from turns out to be corrupt, that replica is scrubbed from the
-    bookkeeping list on the spot (see **Known limitation** below).
-  - `readChunk()` transparently tries every replica of a chunk in order,
-    skipping dead nodes and corrupted copies, until one passes checksum
-    verification.
-- **`FileChunker`** -- splits a file into fixed-size chunks for `Controller.writeChunk`,
-  and reassembles a file from its chunk ids via `Controller.readChunk`.
-- **`Demo`** -- wires everything together: a 6-node cluster, a background
-  heartbeat thread, a background replication-sweep thread, writes a file,
-  kills one node and corrupts a chunk on another, waits for the cluster to
-  self-heal, then reads the file back and confirms it's byte-for-byte intact.
+    replicas than the target replication factor, reads it from a healthy
+    replica over RPC and writes it to a freshly assigned node. If the
+    replica it tries to read from turns out to be corrupted, that replica is
+    scrubbed from the bookkeeping list on the spot (see **Known limitation**
+    below).
+- **`FileChunker`** -- splits a file into fixed-size chunks and fans the
+  writes out across chunks **in parallel** (one task per chunk on a thread
+  pool), and reassembles a file the same way on read -- this is what lets a
+  multi-chunk file spread its I/O across many nodes concurrently instead of
+  one chunk at a time.
+- **`Demo`** -- wires up a 24-node cluster, starts the heartbeat poller and a
+  replication-sweep timer, writes a file in parallel, kills one node's
+  server and corrupts a chunk on another over RPC, waits for the cluster to
+  self-heal, then reads the file back in parallel and confirms it's
+  byte-for-byte intact.
 
 ## Quickstart
 
@@ -57,28 +93,41 @@ Requires JDK 17+ and Maven.
 git clone <this-repo-url>
 cd DistributedFileSystem
 
-mvn test              # run the unit test suite
+mvn test              # run the test suite (starts real local clusters per test)
 mvn compile exec:java # run the end-to-end failure/corruption/healing demo
 ```
 
 Sample demo output:
 
 ```
-Wrote story.txt as 8 chunk(s), replication factor 3
-  story.txt-chunk-0 -> [node-1, node-2, node-3]
-  story.txt-chunk-1 -> [node-2, node-3, node-4]
-  ...
+Started 24 storage nodes, each its own TCP server speaking Protobuf-over-socket (e.g. node-1 on port 46353)
 
-Simulating node-2 failure (heartbeats stop)...
-Simulating on-disk corruption of story.txt-chunk-0 on node-1...
+Wrote story.txt as 15 chunk(s) in parallel (112 ms), replication factor 3
+  story.txt-chunk-0 -> [node-1, node-10, node-11]
+  story.txt-chunk-1 -> [node-10, node-11, node-12]
+  story.txt-chunk-2 -> [node-11, node-12, node-13]
+  ... (12 more chunks)
 
-Waiting for heartbeat timeout + replication sweep to heal the cluster...
+Killing node-1 outright (its TCP server goes down)...
+Corrupting story.txt-chunk-0 on node-10 via RPC...
 
-[scrub] checksum mismatch for story.txt-chunk-0 on node node-1 -- dropping replica
-[replication] healed story.txt-chunk-0 -> node-1 (now 3/3 replicas)
-...
+Waiting for heartbeat timeout + replication sweeps to heal the cluster...
 
+[scrub] checksum mismatch for story.txt-chunk-0 on node node-10 -- dropping replica
+[replication] healed story.txt-chunk-0 -> node-24 (now 3/3 replicas)
+[replication] healed story.txt-chunk-0 -> node-3 (now 4/3 replicas)
+
+Read story.txt back in parallel (31 ms)
 Recovered file matches original: true
+```
+
+## Regenerating the Protobuf sources
+
+Only needed if you change `src/main/proto/dfs.proto`. Requires the `protoc`
+compiler (matching the `protobuf.version` in `pom.xml`, currently 3.21.x):
+
+```bash
+protoc --java_out=src/main/java src/main/proto/dfs.proto
 ```
 
 ## Testing
@@ -87,15 +136,19 @@ Recovered file matches original: true
 mvn test
 ```
 
-`src/test/java` covers each layer:
+`src/test/java` covers each layer. `TestCluster` is a shared fixture that
+starts a real, small cluster of `NodeServer`s on OS-assigned free ports for
+each test -- there's no mocked network layer.
 
-- `ChecksumUtilTest`, `StorageNodeTest` -- checksum correctness, corruption
-  detection, and heartbeat-based liveness at the single-node level.
-- `FileChunkerTest` -- chunking and reassembly round-trip files exactly,
-  including files spanning multiple chunks.
+- `ChecksumUtilTest`, `StorageNodeTest` -- checksum correctness and
+  corruption detection at the local-storage level, no networking involved.
+- `FileChunkerTest` -- parallel chunking and reassembly round-trip files
+  exactly, including a file spanning many chunks across many nodes, and a
+  clean failure when a chunk has no healthy replica left.
 - `ControllerTest` -- round-robin placement, replication-factor enforcement,
-  read failover across corrupted/dead replicas, and the replication-sweep
-  healing behavior under combined node failure + corruption (see below).
+  read failover across a replica corrupted over RPC, and replication-sweep
+  healing under a **real** compound failure: one node's server killed
+  outright, another's chunk corrupted via RPC (see below).
 
 ## Known limitation: healing after simultaneous failure + corruption
 
@@ -107,11 +160,11 @@ only closes part of the gap. Concretely: if a chunk loses one replica to node
 failure and a second replica (of the two remaining) turns out to be corrupt,
 one sweep cycle restores the replication factor from 1 healthy copy to 2, not
 3 -- a second sweep cycle is needed to fully recover. `ControllerTest`
-documents this exact behavior (`fullyRestoringReplicationAfterCorruptionAndStalenessCanTakeTwoSweeps`)
+documents this exact behavior (`fullyRestoringReplicationAfterCompoundFailureCanTakeTwoSweeps`)
 rather than hiding it.
 
-This doesn't affect read correctness -- `readChunk()` independently tries
-every replica and skips dead or corrupted ones, so a file stays readable
+This doesn't affect read correctness -- `readChunk()` independently races
+every alive replica and skips corrupted ones, so a file stays readable
 throughout healing as long as at least one good replica exists. It does mean
 the system is *eventually* consistent about restoring full redundancy after a
 compound failure, across sweep cycles, rather than within a single one. A
@@ -121,8 +174,10 @@ dropped) instead of before.
 
 ## Possible extensions
 
-- Replace in-process `StorageNode` objects with real networked services (gRPC/HTTP).
-- Persist chunks to disk instead of an in-memory `Map`.
+- Persist chunks to disk instead of an in-memory `Map` inside `StorageNode`.
+- Reuse (pool) `NodeClient` connections instead of opening a fresh socket per
+  RPC, and run separate `NodeServer`s as separate OS processes/containers
+  instead of threads in one JVM, for a true multi-process deployment.
 - Proactively prune node ids that have been dead for longer than a grace
   period from a chunk's replica bookkeeping, rather than only removing ids
   discovered to be corrupt (see the known limitation above).
